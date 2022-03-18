@@ -1,0 +1,174 @@
+import requests
+import os
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+import re
+from time import sleep
+from tqdm import tqdm
+import logging
+import argparse
+
+
+logging.basicConfig(filename='pps.log', encoding='utf-8', level=logging.INFO, filemode='w')
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+"""
+Definitions:
+    valid host - a host that is in scope and answering http requests
+    followup - a url on a particular host that should be checked for reflections or errors
+
+"""
+
+default_scope_file = 'analysis/in_scope.txt'
+default_followups_file = 'analysis/folowups.txt'
+
+def bounty_list(file, scope_file):
+    with open(file, 'r') as fio:
+        hosts = fio.readlines()
+
+    hosts = [l.rstrip() for l in hosts]
+    with open(scope_file, 'r') as fio:
+        scope = fio.readlines()
+
+    scope = [l.rstrip() for l in scope]
+
+
+    valid_hosts = []
+    for h in hosts:
+        for d in scope:
+            exp = f"https?://(www)?(\w*)\.{d}"
+            if re.search(exp, h):
+                valid_hosts.append(h)
+
+    with open(default_scope_file, 'w') as fio:
+        for v in valid_hosts:
+            fio.write(f"{v}\n")
+
+def hosts_up(file):
+    with open(file, 'r') as fio:
+        hosts = fio.readlines()
+
+    hosts = [l.rstrip() for l in hosts]
+
+    valid_hosts = []
+    followups = []
+    for h in tqdm(hosts):
+        baseurl = h.split('/')[2].split(':')[0]
+
+        if baseurl in valid_hosts:
+            logging.info(f"{baseurl} is in valid hosts")
+            followups.append(h)
+            continue
+
+        else:
+
+            try:
+                sleep(0.25)
+                r = requests.get(h, verify=False, timeout=1)
+                logging.info(f"{h} requested, status code {r.status_code}")
+                valid_hosts.append(baseurl)
+                followups.append(h)
+
+            except requests.exceptions.ReadTimeout:
+                logging.info("timeout")
+
+            except requests.exceptions.ConnectionError:
+                logging.info("e")
+
+    with open(default_followups_file, 'w') as fio:
+        for f in followups:
+            fio.write(f"{f}\n")
+
+    with open('analysis/valid_hosts.txt', 'w') as fio:
+        for v in valid_hosts:
+            fio.write(f"{v}\n")
+
+
+def check_responses():
+    # check payloads with ' and ", to see if there is any difference
+    payloads = ["""Scan"Bugbounty""", """Scan'Bugbounty"""]
+
+    ignorelist = [".js", ".css", "/js/", "/css/"]
+    with open(default_followups_file, 'r') as fio:
+        urls = fio.readlines()
+    urls = [l.rstrip() for l in urls]
+    total = 0
+    for u in tqdm(urls):
+        badurl = False
+        for i in ignorelist:
+            if i in u:
+                badurl = True
+        if badurl:
+            continue
+        total += 1
+        for p in payloads:
+
+            # be nice to the server
+            sleep(0.5)
+            umod = u.replace("FUZZ", p)
+            r = requests.get(umod, verify=False)
+            logging.debug(f"{umod} - {r.status_code}")
+            if r.status_code == 200:
+
+                if p in r.text:
+                    msg = f"Reflection found in {umod}"
+                    print(msg)
+                    logging.warning(msg)
+
+                    with open("analysis/reflection.txt", 'a') as fio:
+                        fio.write(f"{umod}\n")
+                else:
+                    logging.info("No reflection")
+
+                if "redirect" in umod:
+                    msg = f"possible open redirect in {umod}"
+                    print(msg)
+                    logging.warning(msg)
+                    with open("analysis/redirect.txt", 'a') as fio:
+                        fio.write(f"{umod}\n")
+
+                if "error" in r.text.lower():
+                    msg = f"error in {umod}"
+                    print(msg)
+                    logging.warning(msg)
+                    with open("analysis/errors.txt", 'a') as fio:
+                        fio.write(f"{umod}\n")
+
+                if "<?php" in r.text:
+                    msg = f"php source at {umod}"
+                    print(msg)
+                    logging.warning(msg)
+                    with open("analysis/php.txt", 'a') as fio:
+                        fio.write(f"{umod}\n")
+
+                if "ORA-" in r.text:
+                    msg = f"oracle sql at {umod}"
+                    print(msg)
+                    logging.warning(msg)
+                    with open("analysis/oracle.txt", 'a') as fio:
+                        fio.write(f"{umod}\n")
+
+
+                if "MySQL".lower() in r.text.lower():
+                    msg = f"mysql at {umod}"
+                    print(msg)
+                    logging.warning(msg)
+                    with open("analysis/mysql.txt", 'a') as fio:
+                        fio.write(f"{umod}\n")
+
+    print(total)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Process ParamSpider results")
+    parser.add_argument('results_file', help="The file generated by ParamSpider")
+    parser.add_argument('--in-scope', help="File containing list of domains/subdomains that are in scope")
+    parser.add_argument("--host-up", action="store_true", help="check if host is up")
+    parser.add_argument("--check-payload", action="store_true", help="check if the payload is reflected")
+    args = parser.parse_args()
+
+    if args.results_file and args.in_scope:
+        bounty_list(args.results_file, args.in_scope)
+        if args.host_up:
+            hosts_up(default_scope_file)
+            if args.check_payload:
+                check_responses()
